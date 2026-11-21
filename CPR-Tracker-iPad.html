@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#101820">
+<title>CPR Tracker – Reanimationstraining</title>
+<!-- MediaPipe wird dynamisch geladen (stabiler auf GitHub Pages + Safari) -->
+<style>
+:root{color-scheme:dark;--bg:#101820;--panel:#203442;--accent:#55d6a5;--muted:#c4d2dc}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:#fff;font-family:system-ui,-apple-system,sans-serif}
+header{padding:18px 16px;background:#192b38;text-align:center}
+h1{margin:0;color:var(--accent);font-size:clamp(23px,5vw,34px)}
+header p{margin:5px 0 0;color:var(--muted)}
+main{max-width:1000px;margin:auto;padding:16px}
+.camera{position:relative;background:#000;border-radius:14px;overflow:hidden;min-height:180px}
+video{width:100%;display:block;max-height:58vh;object-fit:contain}
+#overlay{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+.controls{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0}
+button,select{padding:13px 16px;border:0;border-radius:9px;font-size:16px}
+button{background:var(--accent);color:#10231d;font-weight:750}
+button:disabled{opacity:.45}
+button.stop{background:#e45b62;color:white}
+select{background:var(--panel);color:white}
+#status,.notice{padding:12px;background:var(--panel);border-radius:9px;margin:12px 0}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:14px 0}
+.metric{background:var(--panel);border-radius:12px;padding:15px;text-align:center}
+.metric strong{display:block;font-size:clamp(28px,7vw,40px);color:var(--accent);font-variant-numeric:tabular-nums}
+.metric span{font-size:13px;color:var(--muted)}
+h2{font-size:19px;margin:22px 0 8px}
+#log{max-height:180px;overflow:auto;font-size:14px;background:var(--panel);border-radius:9px;padding:10px}
+#log div{padding:4px 0;border-bottom:1px solid #ffffff18}
+.notice{font-size:13px;line-height:1.45;color:var(--muted)}
+@media(min-width:700px){.grid{grid-template-columns:repeat(4,minmax(0,1fr))}.controls button{flex:1}}
+</style>
+</head>
+<body>
+<header><h1>CPR TRACKER</h1><p>Reanimationstraining · Kamera-gestützte Bewegungsschätzung</p></header>
+<main>
+  <div class="camera">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
+  <div class="controls">
+    <select id="cameraMode" aria-label="Kamera auswählen">
+      <option value="environment">Rückkamera</option>
+      <option value="user">Frontkamera</option>
+    </select>
+    <button id="cameraBtn">Kamera starten</button>
+    <button id="startBtn" disabled>Training starten</button>
+    <button id="stopBtn" class="stop" disabled>Training beenden</button>
+  </div>
+  <div id="status" role="status">Bereite KI-Modell vor …</div>
+  <section class="grid" aria-label="Live-Messwerte">
+    <div class="metric"><strong id="count">0</strong><span>Erkannte Bewegungszyklen</span></div>
+    <div class="metric"><strong id="rate">–</strong><span>Bewegungen / Minute</span></div>
+    <div class="metric"><strong id="pause">0,0 s</strong><span>Aktuelle Unterbrechung</span></div>
+    <div class="metric"><strong id="longest">0,0 s</strong><span>Längste Unterbrechung</span></div>
+  </section>
+  <h2>Trainingsprotokoll</h2>
+  <div id="log" aria-live="polite">Noch keine Einträge.</div>
+  <div class="controls"><button id="pdfBtn">Trainingsbericht drucken / als PDF sichern</button></div>
+  <p class="notice"><b>Wichtiger Hinweis:</b> Dies ist ein experimenteller Trainingsprototyp. Die Kamera schätzt Bewegungszyklen aus der Körperpose; sie misst weder Kompressionstiefe noch vollständige Entlastung und ist nicht für echte Notfälle oder zur klinischen Bewertung geeignet. Für belastbares CPR-Feedback ist ein geeignetes Trainingsphantom mit Sensorik erforderlich. Kamerabild und Pose werden in dieser Seite nicht aufgezeichnet.</p>
+</main>
+<script>
+(() => {
+const $ = id => document.getElementById(id);
+const video=$("video"), canvas=$("overlay"), ctx=canvas.getContext("2d");
+let detector=null, stream=null, active=false, raf=0, busy=false;
+let count=0,lastRep=0,repIntervals=[],baseline=null,signal=0,peak=false;
+let pauseStart=null,longestPause=0,started=0,trainingDuration=0,events=[];
+function log(message){
+  const line=new Date().toLocaleTimeString("de-DE")+" – "+message;
+  events.push(line);
+  $("log").innerHTML=events.slice(-60).map(x=>"<div>"+x.replaceAll("&","&amp;").replaceAll("<","&lt;")+"</div>").join("");
+}
+function setStatus(s){$("status").textContent=s}
+async function initialize(){
+  try{
+    setStatus("Lade MediaPipe-Bibliothek …");
+
+    // Dynamischer Import – deutlich stabiler auf GitHub Pages + Safari
+    const visionModule = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs");
+    const { FilesetResolver, PoseLandmarker } = visionModule;
+
+    setStatus("Lade KI-Modell … (kann 15–40 Sekunden dauern, bitte warten)");
+    const vision = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+    );
+
+    const modelUrl = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+
+    // GPU zuerst, bei Fehler CPU (wichtig für iPad)
+    try {
+      detector = await PoseLandmarker.createFromOptions(vision, {
+        baseOptions: { modelAssetPath: modelUrl, delegate: "GPU" },
+        runningMode: "VIDEO",
+        numPoses: 1
+      });
+      setStatus("KI-Modell bereit (GPU). Kamera starten und Person seitlich/schräg ins Bild stellen.");
+    } catch (gpuErr) {
+      console.warn("GPU fehlgeschlagen, versuche CPU:", gpuErr);
+      setStatus("GPU nicht verfügbar – lade mit CPU …");
+      detector = await PoseLandmarker.createFromOptions(vision, {
+        baseOptions: { modelAssetPath: modelUrl, delegate: "CPU" },
+        runningMode: "VIDEO",
+        numPoses: 1
+      });
+      setStatus("KI-Modell bereit (CPU). Kamera starten und Person seitlich/schräg ins Bild stellen.");
+    }
+
+    $("cameraBtn").disabled = false;
+    loop();
+  } catch (e) {
+    console.error(e);
+    setStatus("KI-Modell konnte nicht geladen werden: " + e.message + " – Seite neu laden oder Internet prüfen.");
+    $("cameraBtn").disabled = false;
+  }
+}
+$("cameraBtn").disabled=true;
+$("cameraBtn").addEventListener("click",async()=>{
+  try{
+    if(!navigator.mediaDevices?.getUserMedia)throw new Error("Kamerazugriff benötigt Safari über HTTPS oder localhost.");
+    if(stream)stream.getTracks().forEach(t=>t.stop());
+    stream=await navigator.mediaDevices.getUserMedia({
+      audio:false,
+      video:{facingMode:{ideal:$("cameraMode").value},width:{ideal:1280},height:{ideal:720}}
+    });
+    video.srcObject=stream;
+    await video.play();
+    setStatus("Kamera aktiv. Bitte Oberkörper und Hüfte möglichst vollständig zeigen.");
+    $("startBtn").disabled=!detector;
+  }catch(e){setStatus("Kamera nicht verfügbar: "+e.message);}
+});
+$("startBtn").addEventListener("click",()=>{
+  if(!detector||!stream)return;
+  active=true;count=0;lastRep=0;repIntervals=[];baseline=null;signal=0;peak=false;
+  pauseStart=null;longestPause=0;events=[];started=performance.now();trainingDuration=0;
+  $("count").textContent="0";$("rate").textContent="–";$("pause").textContent="0,0 s";$("longest").textContent="0,0 s";$("log").textContent="Training gestartet.";
+  $("startBtn").disabled=true;$("stopBtn").disabled=false;
+  setStatus("Training läuft – erkannte Bewegungszyklen werden gezählt.");
+});
+$("stopBtn").addEventListener("click",()=>{
+  if(!active)return;
+  active=false;trainingDuration=(performance.now()-started)/1000;
+  if(pauseStart){longestPause=Math.max(longestPause,(performance.now()-pauseStart)/1000);pauseStart=null;}
+  $("pause").textContent="0,0 s";$("longest").textContent=longestPause.toFixed(1).replace(".",",")+" s";
+  $("startBtn").disabled=!stream;$("stopBtn").disabled=true;
+  setStatus("Training beendet.");log("Training beendet.");
+});
+function processPose(result,now){
+  const p=result.landmarks?.[0];
+  if(!p)return;
+  const needed=[11,12,23,24];
+  if(needed.some(i=>(p[i].visibility??0)<0.5))return;
+  // Heuristische Änderung des Schulter-Hüft-Abstands; keine Messung der Brustkorbtiefe.
+  const raw=((p[11].y+p[12].y)/2)-((p[23].y+p[24].y)/2);
+  signal=signal*0.7+raw*0.3;
+  if(baseline===null)baseline=signal;
+  if(!active){baseline=baseline*0.98+signal*0.02;return;}
+  const delta=signal-baseline, threshold=0.012;
+  if(delta>threshold&&!peak)peak=true;
+  if(delta<threshold*0.35&&peak){
+    peak=false;
+    if(!lastRep||now-lastRep>300){
+      count++;$("count").textContent=String(count);
+      if(lastRep){
+        repIntervals.push(now-lastRep);if(repIntervals.length>8)repIntervals.shift();
+        const avg=repIntervals.reduce((a,b)=>a+b,0)/repIntervals.length;
+        $("rate").textContent=String(Math.round(60000/avg));
+      }
+      if(pauseStart!==null){
+        const d=(now-pauseStart)/1000;longestPause=Math.max(longestPause,d);
+        log("Unterbrechung beendet: "+d.toFixed(1)+" s");pauseStart=null;
+      }
+      lastRep=now;
+    }
+  }
+  if(!peak)baseline=baseline*0.999+signal*0.001;
+  if(lastRep&&now-lastRep>1500&&pauseStart===null){
+    pauseStart=lastRep+1500;log("Mögliche Unterbrechung erkannt.");
+  }
+  const current=pauseStart===null?0:(now-pauseStart)/1000;
+  $("pause").textContent=current.toFixed(1).replace(".",",")+" s";
+  $("longest").textContent=Math.max(longestPause,current).toFixed(1).replace(".",",")+" s";
+}
+function loop(){
+  if(video.readyState>=2&&detector&&!busy){
+    busy=true;
+    try{
+      const result=detector.detectForVideo(video,performance.now());
+      processPose(result,performance.now());
+      if(video.videoWidth&&video.videoHeight){
+        if(canvas.width!==video.videoWidth||canvas.height!==video.videoHeight){canvas.width=video.videoWidth;canvas.height=video.videoHeight;}
+        ctx.clearRect(0,0,canvas.width,canvas.height);
+        const p=result.landmarks?.[0];
+        if(p){
+          ctx.fillStyle="#55d6a5";
+          [11,12,23,24].forEach(i=>{ctx.beginPath();ctx.arc(p[i].x*canvas.width,p[i].y*canvas.height,8,0,Math.PI*2);ctx.fill();});
+          ctx.strokeStyle="#55d6a5";ctx.lineWidth=4;ctx.beginPath();
+          ctx.moveTo(p[11].x*canvas.width,p[11].y*canvas.height);ctx.lineTo(p[12].x*canvas.width,p[12].y*canvas.height);
+          ctx.moveTo(p[23].x*canvas.width,p[23].y*canvas.height);ctx.lineTo(p[24].x*canvas.width,p[24].y*canvas.height);ctx.stroke();
+        }
+      }
+    }catch(e){console.error(e);}
+    busy=false;
+  }
+  raf=requestAnimationFrame(loop);
+}
+$("pdfBtn").addEventListener("click",()=>{
+  const duration=active?(performance.now()-started)/1000:trainingDuration;
+  const safeEvents=events.map(x=>"<p>"+x.replaceAll("&","&amp;").replaceAll("<","&lt;")+"</p>").join("");
+  const report=`<!doctype html><html lang="de"><meta charset="utf-8"><title>CPR Trainingsbericht</title>
+  <style>body{font:16px Arial;margin:35px;color:#17232c}h1{color:#167b5b}table{border-collapse:collapse}td{padding:9px 18px 9px 0;border-bottom:1px solid #ddd}.note{margin-top:25px;font-size:12px;color:#555}</style>
+  <h1>CPR Trainingsbericht</h1><p>Erstellt: ${new Date().toLocaleString("de-DE")}</p>
+  <table><tr><td>Erkannte Bewegungszyklen</td><td><b>${count}</b></td></tr>
+  <tr><td>Trainingsdauer</td><td>${(duration/60).toFixed(1)} Minuten</td></tr>
+  <tr><td>Letzte angezeigte Frequenz</td><td>${$("rate").textContent} / Minute</td></tr>
+  <tr><td>Längste Unterbrechung</td><td>${longestPause.toFixed(1)} Sekunden</td></tr></table>
+  <h2>Protokoll</h2>${safeEvents||"<p>Keine Protokolleinträge.</p>"}
+  <p class="note">Experimenteller, kamerabasierter Trainingsprototyp. Bewegungszyklen sind Schätzwerte. Keine Messung von Kompressionstiefe oder vollständiger Entlastung; nicht für echte Notfälle oder klinische Bewertung geeignet.</p>
+  <script>window.onload=()=>window.print()<\/script></html>`;
+  const w=window.open("","_blank");
+  if(!w){setStatus("Pop-up blockiert. Bitte Pop-ups für diese Seite erlauben und erneut versuchen.");return;}
+  w.document.open();w.document.write(report);w.document.close();
+});
+window.addEventListener("pagehide",()=>{if(stream)stream.getTracks().forEach(t=>t.stop());if(raf)cancelAnimationFrame(raf);});
+initialize();
+})();
+</script>
+</body>
+</html>
